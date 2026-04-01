@@ -74,10 +74,8 @@ flowchart TD
 ```mermaid
 erDiagram
     _User {
-        string username
-        string email
         string displayName
-        string avatarUrl
+        file avatar
         string bio
         boolean isLiveFeedPublic
         string expoPushToken
@@ -110,22 +108,22 @@ erDiagram
 ```mermaid
 flowchart TD
     A([App open]) --> B{Parse.User.current?}
-    B -->|yes| C{Biometrics\nenrolled?}
-    B -->|no| D[/auth/login]
+    B -->|yes| C{Biometrics enrolled?}
+    B -->|no| D[Login screen]
     C -->|yes| E[Biometric prompt]
-    C -->|no| F[/(tabs)/home]
+    C -->|no| F[Home screen]
     E -->|success| F
     E -->|fail| D
     D --> G{Has account?}
-    G -->|no| H[/auth/register]
-    G -->|yes| I[Email + password login]
-    H --> J[Fill display name\nemail, password]
-    J --> K[Live feed opt-in toggle\n'Join the live feed?']
+    G -->|no| H[Register screen]
+    G -->|yes| I[Enter email + password]
+    H --> J[Enter display name + email + password]
+    J --> K[Live feed opt-in toggle]
     K --> L[Parse.User.signUp]
     I --> M[Parse.User.logIn]
     L --> F
-    M --> N{Offer biometrics?}
-    N -->|yes| O[Save creds to\nexpo-secure-store]
+    M --> N{First login — offer biometrics?}
+    N -->|yes| O[Save creds to expo-secure-store]
     N -->|no| F
     O --> F
 ```
@@ -140,12 +138,27 @@ flowchart TD
 
 Create these classes in the Back4app dashboard:
 
-**`_User` (built-in — add custom fields)**
-- `displayName` — String
-- `avatarUrl` — String
+**`_User` (built-in fields — do not recreate)**
+
+Parse automatically provides these on every `_User` object. You cannot delete them:
+- `objectId` — String
+- `username` — String (we will set this to the user's email)
+- `email` — String
+- `password` — String
+- `emailVerified` — Boolean
+- `authData` — Object
+- `ACL` — ACL
+- `createdAt` — Date
+- `updatedAt` — Date
+
+**`_User` custom fields to add in the Back4app dashboard**
+- `displayName` — String (enforce uniqueness in the dashboard — this is the user-facing name)
+- `avatar` — File (Parse.File stored on Back4app cloud storage)
 - `bio` — String
 - `isLiveFeedPublic` — Boolean (default: `false`)
 - `expoPushToken` — String
+
+> **Note on username vs email:** Parse requires `username` to be unique. By setting `username` equal to `email` at sign-up, you get uniqueness enforcement for free and users only ever type their email — they never need to invent a separate username. `displayName` is the human-facing name shown in the UI and is also enforced as unique via a `beforeSave` Cloud Function (see below).
 
 **`UserRating`**
 - `user` — Pointer → `_User`
@@ -162,7 +175,7 @@ Create these classes in the Back4app dashboard:
 - `toUser` — Pointer → `_User`
 - `status` — String (`"pending"` | `"accepted"`)
 
-ACL Cloud Function for `UserRating`:
+ACL Cloud Function for `UserRating`, and `displayName` uniqueness enforcement for `_User`:
 
 ```js
 Parse.Cloud.beforeSave('UserRating', req => {
@@ -170,6 +183,20 @@ Parse.Cloud.beforeSave('UserRating', req => {
   acl.setPublicReadAccess(true);
   acl.setWriteAccess(req.user, true);
   req.object.setACL(acl);
+});
+
+// Enforce unique displayName on _User
+Parse.Cloud.beforeSave(Parse.User, async req => {
+  if (!req.object.dirtyKeys().includes('displayName')) return;
+  const displayName = req.object.get('displayName');
+  if (!displayName) throw new Parse.Error(
+    Parse.Error.VALIDATION_ERROR, 'displayName is required');
+  const existing = await new Parse.Query(Parse.User)
+    .equalTo('displayName', displayName)
+    .notEqualTo('objectId', req.object.id ?? '')
+    .first({ useMasterKey: true });
+  if (existing) throw new Parse.Error(
+    Parse.Error.USERNAME_TAKEN, 'That display name is already taken');
 });
 ```
 
@@ -179,19 +206,67 @@ Parse.Cloud.beforeSave('UserRating', req => {
 
 Fields in order: display name → email → password → avatar (optional) → live feed toggle.
 
+> **Note:** There is no separate "username" field shown to the user. `username` is set silently to the email value so Parse's uniqueness constraint handles duplicate email prevention automatically.
+
+Install the image picker dependency first:
+
+```bash
+pnpm add react-native-image-picker
+cd ios && pod install && cd ..
+```
+
+Also add the following key to `ios/Info.plist` to allow photo library access:
+
+```xml
+<key>NSPhotoLibraryUsageDescription</key>
+<string>TV Social needs access to your photos to set a profile picture.</string>
+```
+
 ```ts
 // app/(auth)/register.tsx
+import { launchImageLibrary } from 'react-native-image-picker';
+
+// Pick avatar from device photo library
+const pickAvatar = async (): Promise<Parse.File | null> => {
+  return new Promise(resolve => {
+    launchImageLibrary(
+      { mediaType: 'photo', includeBase64: true, maxWidth: 400, maxHeight: 400 },
+      response => {
+        const asset = response.assets?.[0];
+        if (!asset?.base64 || !asset?.fileName) return resolve(null);
+        const file = new Parse.File(asset.fileName, { base64: asset.base64 });
+        resolve(file);
+      }
+    );
+  });
+};
+
 const onSubmit = async (data: RegisterForm) => {
   const user = new Parse.User();
+  // Set username = email so Parse enforces email uniqueness
   user.set('username', data.email);
   user.set('email', data.email);
   user.set('password', data.password);
   user.set('displayName', data.displayName);
   user.set('isLiveFeedPublic', data.joinLiveFeed);
+
+  if (data.avatarFile) {
+    // Save the ParseFile first, then attach it to the user
+    await data.avatarFile.save();
+    user.set('avatar', data.avatarFile);
+  }
+
   await user.signUp();
   useAuthStore.getState().setUser(user);
   router.replace('/(tabs)/home');
 };
+```
+
+To display the avatar anywhere in the app, call `.url()` on the `ParseFile`:
+
+```ts
+const avatarUrl = user.get('avatar')?.url();
+// Pass to expo-image: <Image source={{ uri: avatarUrl }} />
 ```
 
 ### Task 3 — Login screen + session persistence
